@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant as StdInstant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -19,6 +19,10 @@ const LISTEN_PORT: u16 = 443;
 const CERT_FILE: &str = "server.crt";
 const KEY_FILE: &str = "server.key";
 const BUFFER_SIZE: usize = 4096;
+const MAX_CLIENT_HELLO: usize = 16 * 1024;
+const SNI_PEEK_TIMEOUT_SECS: u64 = 5;
+const FALLBACK_DNS_TTL_SECS: u64 = 60;
+const FALLBACK_CONNECT_TIMEOUT_SECS: u64 = 5;
 // --- DoS caps (SEC FIX): bound authenticated UDP session growth ---
 const MAX_UDP_BUFFER: usize = 64 * 1024; // tcp_buffer cap (was unbounded)
 const MAX_UDP_PEERS: usize = 64; // allowed_peers cap (was unbounded)
@@ -30,12 +34,476 @@ const MAX_UDP_DNS_PER_READ: usize = 8; // domain lookups per TCP read (was unbou
 // ---------------------
 
 static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
-// Pre-parsed loopback backend (perf: avoids per-probe string parse + dispatch;
-// BACKEND_ADDR const + log text kept for tests).
-static BACKEND_SA: OnceLock<SocketAddr> = OnceLock::new();
 
-fn backend_addr() -> SocketAddr {
-    *BACKEND_SA.get_or_init(|| BACKEND_ADDR.parse().expect("BACKEND_ADDR must parse"))
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+impl Endpoint {
+    fn parse(value: &str, default_port: u16) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("empty endpoint".to_string());
+        }
+
+        let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+            let end = rest
+                .find(']')
+                .ok_or_else(|| format!("invalid IPv6 endpoint: {}", value))?;
+            let host = &rest[..end];
+            let tail = &rest[end + 1..];
+            let port = if tail.is_empty() {
+                default_port
+            } else if let Some(port) = tail.strip_prefix(':') {
+                port.parse::<u16>()
+                    .map_err(|_| format!("invalid port in endpoint: {}", value))?
+            } else {
+                return Err(format!("invalid endpoint: {}", value));
+            };
+            (host.to_string(), port)
+        } else if value.matches(':').count() == 1 {
+            let (host, port) = value.rsplit_once(':').expect("one colon");
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| format!("invalid port in endpoint: {}", value))?;
+            (host.to_string(), port)
+        } else if value.matches(':').count() > 1 {
+            let ip = value
+                .parse::<IpAddr>()
+                .map_err(|_| format!("invalid IPv6 endpoint: {}", value))?;
+            (ip.to_string(), default_port)
+        } else {
+            (value.to_string(), default_port)
+        };
+
+        if host.is_empty() {
+            return Err(format!("empty host in endpoint: {}", value));
+        }
+        if port == 0 {
+            return Err(format!("port 0 is not allowed: {}", value));
+        }
+        Ok(Self { host, port })
+    }
+
+    fn socket_addrs(&self) -> Vec<SocketAddr> {
+        match self.host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, self.port)],
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.parse::<Ipv6Addr>().is_ok() {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProxyConfig {
+    trojan_snis: Vec<String>,
+    fallback: Option<Endpoint>,
+    local_fallback: Endpoint,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            trojan_snis: Vec::new(),
+            fallback: None,
+            local_fallback: Endpoint::parse(BACKEND_ADDR, 80)
+                .expect("BACKEND_ADDR must parse"),
+        }
+    }
+}
+
+static PROXY_CONFIG: OnceLock<ProxyConfig> = OnceLock::new();
+
+fn proxy_config() -> &'static ProxyConfig {
+    PROXY_CONFIG.get_or_init(ProxyConfig::default)
+}
+
+fn init_proxy_config(config: ProxyConfig) {
+    let _ = PROXY_CONFIG.set(config);
+}
+
+fn parse_sni_list(value: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for name in value.split(',') {
+        let name = name.trim().trim_end_matches('.');
+        if name.is_empty() {
+            return Err("empty SNI name".to_string());
+        }
+        if !names.iter().any(|existing: &String| existing.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        Err("empty SNI list".to_string())
+    } else {
+        Ok(names)
+    }
+}
+
+#[derive(Default)]
+struct ResolveCache {
+    entries: HashMap<String, (StdInstant, Vec<SocketAddr>)>,
+}
+
+static RESOLVE_CACHE: OnceLock<Mutex<ResolveCache>> = OnceLock::new();
+
+fn resolve_cache() -> &'static Mutex<ResolveCache> {
+    RESOLVE_CACHE.get_or_init(|| Mutex::new(ResolveCache::default()))
+}
+
+async fn resolve_endpoint(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, String> {
+    let fast = endpoint.socket_addrs();
+    if !fast.is_empty() {
+        return Ok(fast);
+    }
+
+    let key = endpoint.to_string();
+    {
+        let cache = resolve_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((_, addrs)) = cache
+            .entries
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(FALLBACK_DNS_TTL_SECS))
+        {
+            return Ok(addrs.clone());
+        }
+    }
+
+    let lookup = timeout(
+        Duration::from_secs(FALLBACK_CONNECT_TIMEOUT_SECS),
+        tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port)),
+    )
+    .await;
+
+    let result = match lookup {
+        Ok(Ok(addrs)) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            if addrs.is_empty() {
+                Err("DNS returned no addresses".to_string())
+            } else {
+                Ok(addrs)
+            }
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("DNS resolution timed out".to_string()),
+    };
+
+    match result {
+        Ok(addrs) => {
+            let mut cache = resolve_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .entries
+                .insert(key, (StdInstant::now(), addrs.clone()));
+            Ok(addrs)
+        }
+        Err(err) => {
+            let cache = resolve_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((_, addrs)) = cache
+                .entries
+                .get(&key)
+                .filter(|(_, addrs)| !addrs.is_empty())
+            {
+                return Ok(addrs.clone());
+            }
+            Err(format!("DNS resolution failed for {}: {}", endpoint, err))
+        }
+    }
+}
+
+async fn connect_endpoint(
+    endpoint: &Endpoint,
+    allow_private: bool,
+) -> Result<TcpStream, String> {
+    let addrs = resolve_endpoint(endpoint).await?;
+    let addrs: Vec<SocketAddr> = if allow_private {
+        addrs
+    } else {
+        addrs
+            .into_iter()
+            .filter(|addr| !is_private_address(addr.ip()))
+            .collect()
+    };
+    if addrs.is_empty() {
+        return Err(format!("blocked private address for {}", endpoint));
+    }
+
+    let mut last_error = String::from("no addresses");
+    for addr in addrs {
+        match timeout(
+            Duration::from_secs(FALLBACK_CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_error = format!("{}: {}", addr, e),
+            Err(_) => last_error = format!("{}: connect timeout", addr),
+        }
+    }
+    Err(format!("connect failed for {}: {}", endpoint, last_error))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SniParse {
+    Complete(Option<String>),
+    Incomplete,
+    Malformed,
+}
+
+fn parse_client_hello_sni(buf: &[u8]) -> SniParse {
+    let mut handshake = Vec::new();
+    let mut pos = 0usize;
+
+    loop {
+        if buf.len().saturating_sub(pos) < 5 {
+            return SniParse::Incomplete;
+        }
+        let content_type = buf[pos];
+        if content_type != 22 {
+            return SniParse::Malformed;
+        }
+        let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
+        if buf.len().saturating_sub(pos + 5) < record_len {
+            return SniParse::Incomplete;
+        }
+        handshake.extend_from_slice(&buf[pos + 5..pos + 5 + record_len]);
+        pos += 5 + record_len;
+
+        if handshake.len() > MAX_CLIENT_HELLO {
+            return SniParse::Malformed;
+        }
+        if handshake.len() >= 4 {
+            if handshake[0] != 1 {
+                return SniParse::Malformed;
+            }
+            let hs_len = ((handshake[1] as usize) << 16)
+                | ((handshake[2] as usize) << 8)
+                | handshake[3] as usize;
+            if hs_len > MAX_CLIENT_HELLO {
+                return SniParse::Malformed;
+            }
+            if handshake.len() >= 4 + hs_len {
+                return parse_client_hello_body(&handshake[4..4 + hs_len]);
+            }
+        }
+        if pos >= buf.len() {
+            return SniParse::Incomplete;
+        }
+    }
+}
+
+fn parse_client_hello_body(body: &[u8]) -> SniParse {
+    let mut pos = 0usize;
+
+    if body.len() < 2 + 32 + 1 {
+        return SniParse::Malformed;
+    }
+    pos += 2 + 32;
+
+    let session_id_len = body[pos] as usize;
+    pos += 1;
+    if body.len().saturating_sub(pos) < session_id_len {
+        return SniParse::Malformed;
+    }
+    pos += session_id_len;
+
+    if body.len().saturating_sub(pos) < 2 {
+        return SniParse::Malformed;
+    }
+    let cipher_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2;
+    if body.len().saturating_sub(pos) < cipher_len {
+        return SniParse::Malformed;
+    }
+    pos += cipher_len;
+
+    if body.len().saturating_sub(pos) < 1 {
+        return SniParse::Malformed;
+    }
+    let compression_len = body[pos] as usize;
+    pos += 1;
+    if body.len().saturating_sub(pos) < compression_len {
+        return SniParse::Malformed;
+    }
+    pos += compression_len;
+
+    if pos == body.len() {
+        return SniParse::Complete(None);
+    }
+    if body.len().saturating_sub(pos) < 2 {
+        return SniParse::Malformed;
+    }
+    let extensions_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos += 2;
+    if body.len().saturating_sub(pos) < extensions_len {
+        return SniParse::Malformed;
+    }
+    let extensions_end = pos + extensions_len;
+
+    while pos + 4 <= extensions_end {
+        let extension_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+        let extension_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+        pos += 4;
+        if extensions_end.saturating_sub(pos) < extension_len {
+            return SniParse::Malformed;
+        }
+        if extension_type == 0 {
+            return parse_sni_extension(&body[pos..pos + extension_len]);
+        }
+        pos += extension_len;
+    }
+
+    if pos != extensions_end {
+        SniParse::Malformed
+    } else {
+        SniParse::Complete(None)
+    }
+}
+
+fn parse_sni_extension(data: &[u8]) -> SniParse {
+    if data.len() < 2 {
+        return SniParse::Malformed;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if data.len().saturating_sub(2) < list_len {
+        return SniParse::Malformed;
+    }
+    let list_end = 2 + list_len;
+    let mut pos = 2usize;
+
+    while pos < list_end {
+        if list_end.saturating_sub(pos) < 3 {
+            return SniParse::Malformed;
+        }
+        let name_type = data[pos];
+        let name_len = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos += 3;
+        if list_end.saturating_sub(pos) < name_len {
+            return SniParse::Malformed;
+        }
+        if name_type == 0 {
+            let name = &data[pos..pos + name_len];
+            if name.is_empty() || name.len() > 255 || name.contains(&0) {
+                return SniParse::Malformed;
+            }
+            return match std::str::from_utf8(name) {
+                Ok(name) if name.is_ascii() => SniParse::Complete(Some(name.to_string())),
+                _ => SniParse::Malformed,
+            };
+        }
+        pos += name_len;
+    }
+
+    SniParse::Complete(None)
+}
+
+async fn peek_client_hello_sni(stream: &TcpStream) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(SNI_PEEK_TIMEOUT_SECS);
+    let mut buf = [0u8; MAX_CLIENT_HELLO];
+
+    loop {
+        let n = match stream.peek(&mut buf).await {
+            Ok(0) => return None,
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        match parse_client_hello_sni(&buf[..n]) {
+            SniParse::Complete(sni) => return sni,
+            SniParse::Malformed => return None,
+            SniParse::Incomplete => {
+                if n >= buf.len() || Instant::now() >= deadline {
+                    return None;
+                }
+                sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+fn sni_matches(peer: Option<&str>, allowed: &[String]) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    let peer = peer.trim_end_matches('.');
+    allowed
+        .iter()
+        .any(|name| peer.eq_ignore_ascii_case(name.trim_end_matches('.')))
+}
+
+fn is_normal_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn boxed_error_is_normal_disconnect(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .map(is_normal_disconnect)
+        .unwrap_or(false)
+}
+
+fn warn_rate_limited(message: &str) {
+    static LAST: OnceLock<Mutex<Option<StdInstant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+        println!("WARN: {}", message);
+        *last = Some(StdInstant::now());
+    }
+}
+
+fn looks_like_http(data: &[u8]) -> bool {
+    const METHODS: [&[u8]; 9] = [
+        b"GET ",
+        b"HEAD ",
+        b"POST ",
+        b"PUT ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"CONNECT ",
+        b"TRACE ",
+        b"PATCH ",
+    ];
+    METHODS.iter().any(|method| data.starts_with(method))
+}
+
+async fn send_http_404<W>(writer: &mut W) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    const RESPONSE: &[u8] =
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    writer.write_all(RESPONSE).await?;
+    writer.flush().await?;
+    let _ = timeout(Duration::from_secs(2), writer.shutdown()).await;
+    Ok(())
 }
 
 fn init_password_hash(password: &str) {
@@ -201,7 +669,7 @@ fn is_private_address(ip: IpAddr) -> bool {
             if let Some(mapped) = ipv6.to_ipv4_mapped() {
                 return is_private_address(IpAddr::V4(mapped));
             }
-            // Deprecated compat ::a.b.c.d (first 96 bits zero) — to_ipv4_mapped
+            // Deprecated compat ::a.b.c.d (first 96 bits zero) â€” to_ipv4_mapped
             // misses it; judge the embedded V4 the same way.
             let oct = ipv6.octets();
             if oct[..12] == [0; 12] && oct[12..] != [0, 0, 0, 0] {
@@ -406,7 +874,7 @@ fn parse_udp_packet_parts(
     let payload_len = u16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
     cursor += 2;
 
-    // Check for CRLF (silent drop on malformed: DoS fix — was println! per packet,
+    // Check for CRLF (silent drop on malformed: DoS fix â€” was println! per packet,
     // attacker-triggerable at line rate, blocking Tokio worker on stdout lock).
     if data.len() < cursor + 2 || &data[cursor..cursor + 2] != b"\r\n" {
         return None;
@@ -571,7 +1039,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn handle_udp_associate(
-    mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    client_stream: tokio_rustls::server::TlsStream<TcpStream>,
     initial_payload: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -700,7 +1168,7 @@ async fn handle_udp_associate(
                 if tcp_consumed > 0 {
                     if tcp_consumed >= tcp_buffer.len() {
                         tcp_buffer.clear();
-                        // MEM FIX: keep 8KB headroom instead of 0 or 64KB — a
+                        // MEM FIX: keep 8KB headroom instead of 0 or 64KB â€” a
                         // burst retained for 1h is freed, steady 100B/1400B and
                         // split/multi traffic (<=4KB/event) never trips it.
                         if tcp_buffer.capacity() > 8192 {
@@ -747,7 +1215,7 @@ async fn handle_udp_associate(
                         } else {
                             // Silent drop (DoS fix): was println! per spoofed packet,
                             // triggerable at line rate by any off-path host knowing
-                            // the ephemeral port — stdout lock + disk amplifier.
+                            // the ephemeral port â€” stdout lock + disk amplifier.
                         }
                     }
                     Err(e) => {
@@ -881,33 +1349,111 @@ async fn handle_tcp_connect(
     Ok(())
 }
 
-async fn fallback_proxy(
-    client_stream: tokio_rustls::server::TlsStream<TcpStream>,
-    initial_data: Vec<u8>,
+#[derive(Debug, PartialEq, Eq)]
+enum PassthroughRoute {
+    Fallback(Endpoint),
+    Drop,
+}
+
+fn passthrough_route(config: &ProxyConfig) -> PassthroughRoute {
+    match &config.fallback {
+        Some(fallback) => PassthroughRoute::Fallback(fallback.clone()),
+        None => PassthroughRoute::Drop,
+    }
+}
+
+async fn fallback_passthrough(
+    client_stream: TcpStream,
+    config: &ProxyConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut backend = match timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(backend_addr())
-    ).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            println!("ERROR: Failed to connect to backend {}: {}", BACKEND_ADDR, e);
-            return Err(Box::new(e));
+    let (target, allow_private) = match passthrough_route(config) {
+        PassthroughRoute::Fallback(target) => (target, true),
+        PassthroughRoute::Drop => {
+            warn_rate_limited("unmatched SNI and no fallback configured");
+            return Ok(());
         }
-        Err(_) => {
-            println!("ERROR: Backend connection timed out");
-            return Err("Backend timeout".into());
+    };
+
+    let backend = match connect_endpoint(&target, allow_private).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn_rate_limited(&e);
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = backend.set_nodelay(true) {
+        warn_rate_limited(&format!(
+            "failed to set TCP_NODELAY on passthrough backend: {}",
+            e
+        ));
+    }
+
+    let (client_read, client_write) = tokio::io::split(client_stream);
+    let (backend_read, backend_write) = tokio::io::split(backend);
+
+    let Ok((client_to_backend, backend_to_client)) = timeout(
+        Duration::from_secs(MAX_FALLBACK_SECS),
+        relay_full_duplex(client_read, client_write, backend_read, backend_write),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+
+    match client_to_backend {
+        Err(e) if !boxed_error_is_normal_disconnect(e.as_ref()) => {
+            warn_rate_limited(&format!("passthrough client relay error: {}", e));
+        }
+        _ => {}
+    }
+    match backend_to_client {
+        Err(e) if !boxed_error_is_normal_disconnect(e.as_ref()) => {
+            warn_rate_limited(&format!("passthrough backend relay error: {}", e));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn fallback_proxy(
+    mut client_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    initial_data: Vec<u8>,
+    config: &ProxyConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut backend = match connect_endpoint(&config.local_fallback, true).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn_rate_limited(&format!(
+                "local fallback {} unavailable: {}",
+                config.local_fallback, e
+            ));
+            if looks_like_http(&initial_data) {
+                match send_http_404(&mut client_stream).await {
+                    Err(e) if !is_normal_disconnect(&e) => {
+                        warn_rate_limited(&format!("failed to send local HTTP response: {}", e));
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
         }
     };
 
     // Latency: disable Nagle BEFORE replay (like target leg) so a sub-MSS
     // replay + instant backend reply skips delayed-ACK; best-effort.
     if let Err(e) = backend.set_nodelay(true) {
-        println!("WARN: Failed to set TCP_NODELAY on backend socket: {}", e);
+        warn_rate_limited(&format!(
+            "failed to set TCP_NODELAY on local fallback: {}",
+            e
+        ));
     }
     // Replay any bytes we already read from the client
-    if !initial_data.is_empty() {
-        backend.write_all(&initial_data).await?;
+    match backend.write_all(&initial_data).await {
+        Ok(()) => {}
+        Err(e) if is_normal_disconnect(&e) => return Ok(()),
+        Err(e) => return Err(Box::new(e)),
     }
     drop(initial_data); // MEM FIX: free replay buffer before long relay
 
@@ -916,13 +1462,26 @@ async fn fallback_proxy(
 
     // --- SEC FIX (DoS): absolute fallback lifetime (was infinite renewable) ---
     // Fallback is unauth camouflage, so its cap is short: trickle pins die here.
-    match timeout(Duration::from_secs(MAX_FALLBACK_SECS),
-        relay_full_duplex(client_read, client_write, backend_read, backend_write)).await {
-        Ok((result1, result2)) => {
-            if let Err(e) = result1 { println!("ERROR: Client to backend pipe error: {}", e); }
-            if let Err(e) = result2 { println!("ERROR: Backend to client pipe error: {}", e); }
+    let Ok((result1, result2)) = timeout(
+        Duration::from_secs(MAX_FALLBACK_SECS),
+        relay_full_duplex(client_read, client_write, backend_read, backend_write),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+
+    match result1 {
+        Err(e) if !boxed_error_is_normal_disconnect(e.as_ref()) => {
+            warn_rate_limited(&format!("client to local fallback pipe error: {}", e));
         }
-        Err(_) => println!("INFO: Fallback session reached absolute lifetime, closing."),
+        _ => {}
+    }
+    match result2 {
+        Err(e) if !boxed_error_is_normal_disconnect(e.as_ref()) => {
+            warn_rate_limited(&format!("local fallback to client pipe error: {}", e));
+        }
+        _ => {}
     }
 
     Ok(())
@@ -932,7 +1491,7 @@ async fn fallback_proxy(
 ///
 /// Unlike racing the two legs with `select!`, one direction reaching EOF (or
 /// erroring) never truncates the other, which may still carry in-flight reply
-/// bytes — e.g. a download tail arriving after the upload leg finished, the
+/// bytes â€” e.g. a download tail arriving after the upload leg finished, the
 /// exact shape of a bidirectional speedtest. Returns each leg's result so
 /// callers keep their exact per-direction log lines.
 ///
@@ -971,19 +1530,25 @@ where
     loop {
         // --- SEC FIX: 5-Minute Idle Timeout for TCP Connections ---
         match timeout(Duration::from_secs(300), reader.read(&mut buffer)).await {
-            Ok(Ok(0)) => break, // Clean EOF
+            Ok(Ok(0)) => {
+                let _ = timeout(Duration::from_secs(2), writer.shutdown()).await;
+                break; // Clean EOF
+            }
             Ok(Ok(n)) => {
                 // Throughput: single 60s budget for write+flush (one timer
-                // insert/cancel instead of two). Same Ok/Err/break mapping:
-                // write/flush errors propagate as Err (write-side asymmetry),
-                // timeout ends the leg cleanly; other leg unaffected (join).
-                // Pushes records promptly (same bytes, less tail latency).
+                // insert/cancel instead of two). Normal peer disconnects end
+                // the leg cleanly; other write/flush errors propagate.
                 match timeout(Duration::from_secs(60), async {
                     writer.write_all(&buffer[..n]).await?;
                     writer.flush().await
                 }).await {
                     Ok(Ok(())) => {},
-                    Ok(Err(e)) => return Err(Box::new(e)),
+                    Ok(Err(e)) => {
+                        if is_normal_disconnect(&e) {
+                            break;
+                        }
+                        return Err(Box::new(e));
+                    }
                     Err(_) => {
                         println!("WARN: TCP relay write timed out (slow reader), closing leg.");
                         break;
@@ -992,9 +1557,7 @@ where
             }
             Ok(Err(e)) => {
                 // Ignore common connection resets/broken pipes
-                if e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::BrokenPipe
-                {
+                if is_normal_disconnect(&e) {
                     break;
                 }
                 return Err(Box::new(e));
@@ -1009,10 +1572,35 @@ where
     Ok(())
 }
 
+fn is_expected_tls_handshake_error(error: &std::io::Error) -> bool {
+    if is_normal_disconnect(error) {
+        return true;
+    }
+    let Some(inner) = error.get_ref() else {
+        return false;
+    };
+    matches!(
+        inner.downcast_ref::<rustls::Error>(),
+        Some(rustls::Error::AlertReceived(_))
+            | Some(rustls::Error::PeerIncompatible(_))
+            | Some(rustls::Error::PeerMisbehaved(_))
+            | Some(rustls::Error::InvalidMessage(_))
+    )
+}
+
 async fn handle_client(
-    stream: TcpStream, 
+    stream: TcpStream,
     tls_acceptor: TlsAcceptor,
-    semaphore: Arc<Semaphore>
+    semaphore: Arc<Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    handle_client_with_config(stream, tls_acceptor, semaphore, proxy_config()).await
+}
+
+async fn handle_client_with_config(
+    stream: TcpStream,
+    tls_acceptor: TlsAcceptor,
+    semaphore: Arc<Semaphore>,
+    config: &ProxyConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_addr = stream.peer_addr()?;
     // --- SEC FIX (DoS): cap concurrent handshakes BEFORE TLS ---
@@ -1032,11 +1620,21 @@ async fn handle_client(
     if let Err(e) = stream.set_nodelay(true) {
         println!("WARN: Failed to set TCP_NODELAY on client socket: {}", e);
     }
-    
+
+    if !config.trojan_snis.is_empty() {
+        let client_sni = peek_client_hello_sni(&stream).await;
+        if !sni_matches(client_sni.as_deref(), &config.trojan_snis) {
+            return fallback_passthrough(stream, config).await;
+        }
+    }
+
     // --- SEC FIX: TLS Handshake Timeout (Slowloris Protection) ---
     let mut tls_stream = match timeout(Duration::from_secs(10), tls_acceptor.accept(stream)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
+            if is_expected_tls_handshake_error(&e) {
+                return Ok(());
+            }
             println!("ERROR: TLS handshake failed for {}: {}", client_addr, e);
             return Err(Box::new(e));
         }
@@ -1049,7 +1647,7 @@ async fn handle_client(
 
     
     // Handshake buffer is lazy (MEM FIX): capacity is invisible, and the
-    // max header is 320B — avoids 512B/conn upfront (~256KB @512).
+    // max header is 320B â€” avoids 512B/conn upfront (~256KB @512).
     let mut initial_buf = Vec::new();
     let mut temp_buf = [0u8; BUFFER_SIZE];
     
@@ -1087,7 +1685,7 @@ async fn handle_client(
     // Handle timeout, connection errors, or explicitly invalid HTTP requests/buffer lengths
     if read_result.is_err() || initial_buf.len() < 58 {
         println!("INFO: Routing suspicious probe or HTTP request to fallback.");
-        return fallback_proxy(tls_stream, initial_buf).await; 
+        return fallback_proxy(tls_stream, initial_buf, config).await;
     }
     
     let data = &initial_buf;
@@ -1099,7 +1697,7 @@ async fn handle_client(
         Ok(hash) => hash,
         Err(_) => {
             println!("INFO: Invalid hash encoding. Routing to fallback.");
-            return fallback_proxy(tls_stream, initial_buf).await; 
+            return fallback_proxy(tls_stream, initial_buf, config).await;
         }
     };
 
@@ -1107,7 +1705,7 @@ async fn handle_client(
 
     if !constant_time_eq(received_hash.as_bytes(), expected_hash.as_bytes()) || &data[56..58] != b"\r\n" {
         println!("INFO: Invalid password or framing. Routing to fallback.");
-        return fallback_proxy(tls_stream, initial_buf).await; 
+        return fallback_proxy(tls_stream, initial_buf, config).await;
     }
     
     // ==========================================
@@ -1117,7 +1715,7 @@ async fn handle_client(
     let request_data = &data[58..];
     if request_data.is_empty() {
         println!("INFO: Authenticated but missing payload. Proxying to fallback with EMPTY buffer to prevent password leak.");
-        return fallback_proxy(tls_stream, Vec::new()).await;
+        return fallback_proxy(tls_stream, Vec::new(), config).await;
     }
     
     let cmd = request_data[0];
@@ -1130,7 +1728,7 @@ async fn handle_client(
             println!("WARN: Invalid address in request: {}. Routing to fallback without password.", e);
             let buf = request_data.to_vec();
             drop(initial_buf); // MEM FIX: free handshake buffer before relay
-            return fallback_proxy(tls_stream, buf).await; 
+            return fallback_proxy(tls_stream, buf, config).await; 
         }
     };
     
@@ -1139,7 +1737,7 @@ async fn handle_client(
         println!("WARN: Insufficient data for port. Routing to fallback without password.");
         let buf = request_data.to_vec();
         drop(initial_buf); // MEM FIX
-        return fallback_proxy(tls_stream, buf).await;
+        return fallback_proxy(tls_stream, buf, config).await;
     }
     
     let port = u16::from_be_bytes([request_data[cursor], request_data[cursor + 1]]);
@@ -1150,7 +1748,7 @@ async fn handle_client(
         println!("WARN: Malformed request: missing final CRLF. Routing to fallback without password.");
         let buf = request_data.to_vec();
         drop(initial_buf); // MEM FIX
-        return fallback_proxy(tls_stream, buf).await;
+        return fallback_proxy(tls_stream, buf, config).await;
     }
     cursor += 2;
     
@@ -1174,7 +1772,7 @@ async fn handle_client(
             println!("WARN: Unsupported command: {}. Routing to fallback without password.", cmd);
             let buf = request_data.to_vec();
             drop(initial_buf);
-            fallback_proxy(tls_stream, buf).await
+            fallback_proxy(tls_stream, buf, config).await
         }
     }
 }
@@ -1227,12 +1825,12 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
     // Build TLS config.
     //
     // Cipher-suite preference (every default suite, AES-128-GCM first): any
-    // client that connected before still can (same intersection — only the
+    // client that connected before still can (same intersection â€” only the
     // server's preference order changed). AES-128-GCM needs fewer rounds
     // than AES-256-GCM for the same traffic while staying the TLS 1.3
     // mandatory suite, which is what caps throughput on CPUs without AES
     // acceleration (e.g. phones) where software AES-256 is the bottleneck.
-    let mut config = ServerConfig::builder()
+    let config = ServerConfig::builder()
         .with_cipher_suites(&[
             rustls::cipher_suite::TLS13_AES_128_GCM_SHA256,
             rustls::cipher_suite::TLS13_AES_256_GCM_SHA384,
@@ -1248,21 +1846,99 @@ fn load_tls_config() -> Result<ServerConfig, Box<dyn std::error::Error>> {
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
         .with_no_client_auth()
         .with_single_cert(certs, keys[0].clone())?;
-        // Add this: advertise h2 and http/1.1, matching what real Nginx does
-    config.alpn_protocols = vec![
-        b"h2".to_vec(),
-        b"http/1.1".to_vec(),
-    ];
     Ok(config)
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "Usage: rustytrojan <password> [--sni <name[,name...]>] [--fallback <host:port>] [--local-fallback <host:port>]"
+    );
+    std::process::exit(1);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let password = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: trojan-server <password>");
-        std::process::exit(1);
-    });
+    let mut args = std::env::args().skip(1);
+    let password = args.next().unwrap_or_else(|| usage());
+
+    let mut config = ProxyConfig::default();
+    if let Ok(value) = std::env::var("TROJAN_SNI") {
+        config.trojan_snis = parse_sni_list(&value).unwrap_or_else(|e| {
+            eprintln!("FATAL: invalid TROJAN_SNI: {}", e);
+            std::process::exit(1);
+        });
+    }
+    if let Ok(value) = std::env::var("FALLBACK_ADDR") {
+        config.fallback = Some(Endpoint::parse(&value, 443).unwrap_or_else(|e| {
+            eprintln!("FATAL: invalid FALLBACK_ADDR: {}", e);
+            std::process::exit(1);
+        }));
+    }
+    if let Ok(value) = std::env::var("LOCAL_FALLBACK_ADDR") {
+        config.local_fallback = Endpoint::parse(&value, 80).unwrap_or_else(|e| {
+            eprintln!("FATAL: invalid LOCAL_FALLBACK_ADDR: {}", e);
+            std::process::exit(1);
+        });
+    }
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sni" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("FATAL: --sni requires a value");
+                    usage();
+                });
+                config.trojan_snis = parse_sni_list(&value).unwrap_or_else(|e| {
+                    eprintln!("FATAL: invalid --sni: {}", e);
+                    std::process::exit(1);
+                });
+            }
+            "--fallback" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("FATAL: --fallback requires a value");
+                    usage();
+                });
+                config.fallback = Some(Endpoint::parse(&value, 443).unwrap_or_else(|e| {
+                    eprintln!("FATAL: invalid --fallback: {}", e);
+                    std::process::exit(1);
+                }));
+            }
+            "--local-fallback" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("FATAL: --local-fallback requires a value");
+                    usage();
+                });
+                config.local_fallback = Endpoint::parse(&value, 80).unwrap_or_else(|e| {
+                    eprintln!("FATAL: invalid --local-fallback: {}", e);
+                    std::process::exit(1);
+                });
+            }
+            "-h" | "--help" => usage(),
+            _ => {
+                eprintln!("FATAL: unknown argument: {}", arg);
+                usage();
+            }
+        }
+    }
+
+    init_proxy_config(config);
     init_password_hash(&password);
+
+    let config = proxy_config();
+    if config.trojan_snis.is_empty() {
+        println!(
+            "WARN: No --sni/TROJAN_SNI configured; TLS is terminated for every connection."
+        );
+    } else {
+        println!(
+            "INFO: Trojan enabled for {} SNI name(s); unmatched TLS connections use the fallback only.",
+            config.trojan_snis.len()
+        );
+        match &config.fallback {
+            Some(fallback) => println!("INFO: No-SNI fallback is {}.", fallback),
+            None => println!("INFO: Connections without an SNI will be closed."),
+        }
+    }
     // Load TLS configuration
     let tls_config = match load_tls_config() {
         Ok(config) => config,
@@ -1469,7 +2145,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 1. Configuration constants — exact values
+    // 1. Configuration constants â€” exact values
     // ------------------------------------------------------------------------
 
     #[test]
@@ -1508,7 +2184,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 2. sha224_hex — known vectors + properties
+    // 2. sha224_hex â€” known vectors + properties
     // ------------------------------------------------------------------------
 
     #[test]
@@ -1601,7 +2277,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 4. is_private_address — IPv4
+    // 4. is_private_address â€” IPv4
     // ------------------------------------------------------------------------
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -1619,7 +2295,7 @@ mod exact_functionality_tests {
     fn test_v4_private_10_blocked() {
         assert!(is_private_address(v4(10, 0, 0, 1)));
         assert!(is_private_address(v4(10, 255, 255, 255)));
-        // 11/8 is public (only 10/8 is private) — exact boundary
+        // 11/8 is public (only 10/8 is private) â€” exact boundary
         assert!(!is_private_address(v4(11, 0, 0, 1)));
         assert!(!is_private_address(v4(9, 255, 255, 255)));
     }
@@ -1638,7 +2314,7 @@ mod exact_functionality_tests {
     fn test_v4_private_192_168_blocked_and_boundary() {
         assert!(is_private_address(v4(192, 168, 0, 1)));
         assert!(is_private_address(v4(192, 168, 255, 255)));
-        // 192.167/16 is public — exact /16 boundary
+        // 192.167/16 is public â€” exact /16 boundary
         assert!(!is_private_address(v4(192, 167, 1, 1)));
         assert!(!is_private_address(v4(192, 169, 1, 1)));
     }
@@ -1683,7 +2359,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 5. is_private_address — IPv6
+    // 5. is_private_address â€” IPv6
     // ------------------------------------------------------------------------
 
     fn v6(s: &str) -> IpAddr {
@@ -1740,7 +2416,7 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_v6_mapped_ipv4_allowed_quirk() {
-        // SEC FIX: IPv4-mapped embeds are judged as V4 — all private maps BLOCKED.
+        // SEC FIX: IPv4-mapped embeds are judged as V4 â€” all private maps BLOCKED.
         let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
         assert!(is_private_address(IpAddr::V6(mapped)));
         let mapped10: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
@@ -2065,7 +2741,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 8. encode_udp_response — exact bytes
+    // 8. encode_udp_response â€” exact bytes
     // ------------------------------------------------------------------------
 
     #[test]
@@ -2178,7 +2854,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 9. is_trojan_header_complete — exact lengths
+    // 9. is_trojan_header_complete â€” exact lengths
     // ------------------------------------------------------------------------
 
     fn header_prefix_ipv4() -> Vec<u8> {
@@ -2514,7 +3190,7 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 13. pipe_data — forwarding, EOF, error mapping
+    // 13. pipe_data â€” forwarding, EOF, error mapping
     // ------------------------------------------------------------------------
 
     #[tokio::test]
@@ -2592,14 +3268,14 @@ mod exact_functionality_tests {
     }
 
     // ------------------------------------------------------------------------
-    // 14. load_tls_config — error paths (no cert files in repo)
+    // 14. load_tls_config â€” error paths (no cert files in repo)
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_load_tls_config_missing_files_returns_err() {
         // Repo ships without server.crt/server.key; loader must fail
         // gracefully (Err, not panic). If files happen to exist in the test
-        // cwd this assertion would not apply — guard by checking existence.
+        // cwd this assertion would not apply â€” guard by checking existence.
         if !std::path::Path::new(CERT_FILE).exists() || !std::path::Path::new(KEY_FILE).exists() {
             assert!(load_tls_config().is_err());
         } else {
@@ -2623,22 +3299,19 @@ mod exact_functionality_tests {
         let key_der = cert.serialize_private_key_der();
         let server_certs = vec![Certificate(cert_der.clone())];
         let key = PrivateKey(key_der);
-        let mut server_cfg = ServerConfig::builder()
+        let server_cfg = ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(server_certs, key)
             .unwrap();
-        // Must match production ALPN exactly.
-        server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
 
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add(&Certificate(cert_der)).unwrap();
-        let mut client_cfg = rustls::ClientConfig::builder()
+        let client_cfg = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        client_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
         TestTlsPair { acceptor, connector }
     }
@@ -2769,7 +3442,7 @@ mod exact_functionality_tests {
             b"",
         );
         match run_handle_client_with_input(hdr).await {
-            Ok(()) => {} // backend was up and proxied — also proves fallback
+            Ok(()) => {} // backend was up and proxied â€” also proves fallback
             Err(msg) => assert!(
                 !msg.contains("Blocked"),
                 "invalid password must go to fallback, got: {}",
@@ -2892,26 +3565,22 @@ mod exact_functionality_tests {
         let _ = res.unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_e2e_tls_alpn_matches_production() {
-        // The production loader advertises h2 + http/1.1. Our test acceptor
-        // must do the same or clients would observe different behaviour.
-        let acceptor_cfg = test_tls_acceptor();
-        let _ = acceptor_cfg; // construction itself proves single-cert path works
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let certs = vec![Certificate(cert.serialize_der().unwrap())];
-        let key = PrivateKey(cert.serialize_private_key_der());
-        let mut cfg = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap();
-        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    #[test]
+    fn test_e2e_tls_no_alpn_matches_production() {
+        let _g = tls_test_guard();
+        if !tls_files_exist() {
+            eprintln!("SKIP: real TLS files not present");
+            return;
+        }
+        let cfg = load_tls_config().expect("production TLS config must load");
+        assert!(
+            cfg.alpn_protocols.is_empty(),
+            "production must not advertise ALPN it cannot serve"
+        );
     }
 
     // ========================================================================
-    // EXTRA COVERAGE — areas not covered by the first suite
+    // EXTRA COVERAGE â€” areas not covered by the first suite
     // ========================================================================
 
     static BACKEND_LOCK: Mutex<()> = Mutex::new(());
@@ -2932,7 +3601,9 @@ mod exact_functionality_tests {
         assert!(res.is_ok(), "idle timeout must break cleanly with Ok");
     }
 
-    struct FailWriter;
+    struct FailWriter {
+        kind: std::io::ErrorKind,
+    }
     impl tokio::io::AsyncWrite for FailWriter {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -2940,7 +3611,7 @@ mod exact_functionality_tests {
             _buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
             std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
+                self.kind,
                 "injected write fail",
             )))
         }
@@ -2959,13 +3630,34 @@ mod exact_functionality_tests {
     }
 
     #[tokio::test]
-    async fn test_pipe_data_writer_error_propagates_err() {
-        // Reader has data, writer always fails -> write_all `?` propagates Err.
+    async fn test_pipe_data_writer_broken_pipe_breaks_ok() {
+        // Peer disconnects during a write are a normal end of the leg.
         let (mut w1, r1) = tokio::io::duplex(1024);
         w1.write_all(b"data-for-failing-writer").await.unwrap();
         drop(w1);
-        let res = pipe_data(r1, FailWriter).await;
-        assert!(res.is_err(), "writer failure must propagate as Err");
+        let res = pipe_data(
+            r1,
+            FailWriter {
+                kind: std::io::ErrorKind::BrokenPipe,
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "write-side BrokenPipe must break cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_pipe_data_writer_other_error_propagates_err() {
+        let (mut w1, r1) = tokio::io::duplex(1024);
+        w1.write_all(b"data-for-failing-writer").await.unwrap();
+        drop(w1);
+        let res = pipe_data(
+            r1,
+            FailWriter {
+                kind: std::io::ErrorKind::InvalidData,
+            },
+        )
+        .await;
+        assert!(res.is_err(), "unexpected write failures must propagate");
     }
 
     // ---- TLS handshake 10s timeout (real clock; ~10s) ------------------------
@@ -3006,7 +3698,7 @@ mod exact_functionality_tests {
         ensure_test_password();
         // Zero-permit semaphore: try_acquire fails PRE-handshake now (DoS fix:
         // permit caps handshakes too), so the server drops TCP immediately and
-        // the client handshake fails — either outcome proves the drop.
+        // the client handshake fails â€” either outcome proves the drop.
         let pair = test_tls_matched_pair();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3318,8 +4010,8 @@ mod exact_functionality_tests {
 
     #[test]
     fn test_sha224_unicode_deterministic_len() {
-        let h1 = sha224_hex("pässwörd🔑");
-        let h2 = sha224_hex("pässwörd🔑");
+        let h1 = sha224_hex("pÃ¤sswÃ¶rdðŸ”‘");
+        let h2 = sha224_hex("pÃ¤sswÃ¶rdðŸ”‘");
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 56);
         assert_ne!(h1, sha224_hex("password"));
@@ -3702,7 +4394,7 @@ mod exact_functionality_tests {
     }
 
     #[test]
-    fn test_load_tls_valid_pkcs8_success_and_alpn() {
+    fn test_load_tls_valid_pkcs8_success_no_alpn() {
         let _g = tls_test_guard();
         if tls_files_exist() {
             eprintln!("SKIP: real TLS files present");
@@ -3715,11 +4407,11 @@ mod exact_functionality_tests {
         std::fs::remove_file(CERT_FILE).ok();
         std::fs::remove_file(KEY_FILE).ok();
         let cfg = res.expect("valid PKCS#8 cert+key must load");
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert!(cfg.alpn_protocols.is_empty());
     }
 
     // ========================================================================
-    // ROUND 3 — deeper edges still uncovered
+    // ROUND 3 â€” deeper edges still uncovered
     // ========================================================================
 
     // ---- parse_udp_packet: trailing / embedded / boundary variants -----------
@@ -4007,7 +4699,7 @@ mod exact_functionality_tests {
         assert_eq!(format!("{}:{}", LISTEN_HOST, LISTEN_PORT), "0.0.0.0:443");
     }
 
-    // ---- pipe: write-side ConnectionReset also propagates -------------------------
+    // ---- pipe: write-side ConnectionReset is a normal disconnect --------------
 
     struct FailWriterReset;
     impl tokio::io::AsyncWrite for FailWriterReset {
@@ -4036,13 +4728,12 @@ mod exact_functionality_tests {
     }
 
     #[tokio::test]
-    async fn test_pipe_write_reset_propagates_err_asymmetry() {
-        // Read-side Reset/BrokenPipe -> Ok (ignored). Write-side Reset (and
-        // BrokenPipe) -> Err via `?`. Lock in that asymmetry explicitly.
+    async fn test_pipe_write_reset_breaks_ok_on_both_sides() {
+        // Normal peer disconnects are ignored on read and write sides.
         let (mut w1, r1) = tokio::io::duplex(1024);
         w1.write_all(b"payload").await.unwrap();
         drop(w1);
-        assert!(pipe_data(r1, FailWriterReset).await.is_err());
+        assert!(pipe_data(r1, FailWriterReset).await.is_ok());
 
         let r = FailReader { kind: std::io::ErrorKind::ConnectionReset };
         assert!(pipe_data(r, tokio::io::sink()).await.is_ok());
@@ -4564,7 +5255,7 @@ mod exact_functionality_tests {
     }
 
     // ========================================================================
-    // ROUND 4 — still-uncovered branches
+    // ROUND 4 â€” still-uncovered branches
     // ========================================================================
 
     // ---- sha224: README example + standard sentence + 100k --------------------
@@ -4790,7 +5481,7 @@ mod exact_functionality_tests {
     async fn test_e2e_tcp_allowed_unroutable_connect_failure_not_blocked() {
         // 8.8.8.8:81 is public (ALLOWED) but port 81 is closed/filtered, so
         // handle_tcp_connect must pass SSRF+DNS and fail at TcpStream::connect
-        // ("Failed to connect"/unreachable/timeout) — never fallback, never "Blocked".
+        // ("Failed to connect"/unreachable/timeout) â€” never fallback, never "Blocked".
         // (240.0.0.1 was used before the SEC FIX; it is now SSRF-blocked.)
         ensure_test_password();
         assert!(!is_private_address(v4(8, 8, 8, 8)));
@@ -4945,7 +5636,7 @@ mod exact_functionality_tests {
     #[tokio::test]
     async fn test_fallback_no_backend_returns_within_12s_not_hung() {
         // With nothing on 127.0.0.1:80 the fallback connect must resolve
-        // within the 5s backend timeout (plus handshake/read overhead) —
+        // within the 5s backend timeout (plus handshake/read overhead) â€”
         // never the 60s header wait nor the 300s pipe idle.
         ensure_test_password();
         let _net_guard = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5057,7 +5748,7 @@ mod exact_functionality_tests {
     }
 
     // ========================================================================
-    // ROUND 5 — remaining uncovered branches
+    // ROUND 5 â€” remaining uncovered branches
     // ========================================================================
 
     // ---- is_private: shared / benchmarking / v6 special-use allowed ----------
@@ -5629,7 +6320,7 @@ mod exact_functionality_tests {
         drop(tls);
         let _ = timeout(Duration::from_secs(10), server).await;
         match res {
-            Ok(Ok(0)) => {}, // clean EOF: cap closed session — fixed
+            Ok(Ok(0)) => {}, // clean EOF: cap closed session â€” fixed
             Ok(Ok(_)) => {}, // any data/EOF also proves no 5min hang
             Ok(Err(_)) => {}, // reset also proves close
             Err(_) => panic!("oversized garbage must close session quickly (cap), not hang"),
@@ -5825,7 +6516,7 @@ mod exact_functionality_tests {
     }
 
     // ========================================================================
-    // ROUND 6 — extraction cross-checks (hoisted fns vs reference copies)
+    // ROUND 6 â€” extraction cross-checks (hoisted fns vs reference copies)
     // ========================================================================
 
     #[test]
@@ -5927,6 +6618,285 @@ mod exact_functionality_tests {
             let s = split.min(clean.len());
             check_stream(&[&clean[..s], &clean[s..]]);
         }
+    }
+
+    fn build_test_client_hello(sni: Option<&str>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        if let Some(name) = sni {
+            let name = name.as_bytes();
+            let mut extension = Vec::new();
+            extension.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+            extension.push(0);
+            extension.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            extension.extend_from_slice(name);
+            extensions.extend_from_slice(&0u16.to_be_bytes());
+            extensions.extend_from_slice(&(extension.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&extension);
+        }
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = vec![1u8];
+        let len = body.len();
+        handshake.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![22u8, 3, 3];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn test_parse_client_hello_sni_complete_and_fragmented() {
+        let hello = build_test_client_hello(Some("secret.example"));
+        assert_eq!(
+            parse_client_hello_sni(&hello),
+            SniParse::Complete(Some("secret.example".to_string()))
+        );
+
+        for cut in 0..hello.len() {
+            assert_eq!(
+                parse_client_hello_sni(&hello[..cut]),
+                SniParse::Incomplete,
+                "prefix {} must wait for more bytes",
+                cut
+            );
+        }
+
+        let handshake = &hello[5..];
+        let split = 24;
+        let mut fragmented = Vec::new();
+        for part in [&handshake[..split], &handshake[split..]] {
+            fragmented.extend_from_slice(&[22, 3, 3]);
+            fragmented.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            fragmented.extend_from_slice(part);
+        }
+        assert_eq!(
+            parse_client_hello_sni(&fragmented),
+            SniParse::Complete(Some("secret.example".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_client_hello_without_sni() {
+        let hello = build_test_client_hello(None);
+        assert_eq!(parse_client_hello_sni(&hello), SniParse::Complete(None));
+    }
+
+    #[test]
+    fn test_parse_client_hello_malformed() {
+        let mut hello = build_test_client_hello(Some("secret.example"));
+        hello[0] = 23;
+        assert_eq!(parse_client_hello_sni(&hello), SniParse::Malformed);
+
+        assert_eq!(parse_client_hello_sni(&[]), SniParse::Incomplete);
+        assert_eq!(parse_client_hello_sni(&[22, 3, 3, 0]), SniParse::Incomplete);
+    }
+
+    #[test]
+    fn test_sni_matching_normalizes_case_and_dots() {
+        let allowed = vec!["Secret.Example".to_string(), "second.example".to_string()];
+        assert!(sni_matches(Some("secret.example."), &allowed));
+        assert!(sni_matches(Some("SECOND.EXAMPLE"), &allowed));
+        assert!(!sni_matches(Some("other.example"), &allowed));
+        assert!(!sni_matches(None, &allowed));
+    }
+
+    #[test]
+    fn test_sni_list_parsing() {
+        assert_eq!(
+            parse_sni_list("a.example, A.EXAMPLE., b.example").unwrap(),
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
+        assert!(parse_sni_list("").is_err());
+        assert!(parse_sni_list("a.example, ,b.example").is_err());
+        assert!(ProxyConfig::default().fallback.is_none());
+    }
+
+    #[test]
+    fn test_passthrough_route_never_uses_requested_sni() {
+        let fallback = Endpoint::parse("127.0.0.1:8443", 443).unwrap();
+        let config = ProxyConfig {
+            trojan_snis: vec!["secret.example".to_string()],
+            fallback: Some(fallback.clone()),
+            local_fallback: Endpoint::parse(BACKEND_ADDR, 80).unwrap(),
+        };
+
+        assert_eq!(
+            passthrough_route(&config),
+            PassthroughRoute::Fallback(fallback)
+        );
+
+        let config = ProxyConfig {
+            fallback: None,
+            ..config
+        };
+        assert_eq!(passthrough_route(&config), PassthroughRoute::Drop);
+    }
+
+    #[test]
+    fn test_endpoint_parsing_and_display() {
+        let host = Endpoint::parse("example.com", 443).unwrap();
+        assert_eq!(host.host, "example.com");
+        assert_eq!(host.port, 443);
+        assert_eq!(host.to_string(), "example.com:443");
+
+        let explicit = Endpoint::parse("example.com:8443", 443).unwrap();
+        assert_eq!(explicit.port, 8443);
+
+        let v6 = Endpoint::parse("[::1]:8443", 443).unwrap();
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, 8443);
+        assert_eq!(v6.to_string(), "[::1]:8443");
+
+        let bare_v6 = Endpoint::parse("::1", 443).unwrap();
+        assert_eq!(bare_v6.port, 443);
+        assert!(Endpoint::parse("", 443).is_err());
+        assert!(Endpoint::parse("example.com:0", 443).is_err());
+        assert!(Endpoint::parse("example.com:not-a-port", 443).is_err());
+    }
+
+    #[test]
+    fn test_looks_like_http() {
+        assert!(looks_like_http(b"GET / HTTP/1.1\r\n"));
+        assert!(looks_like_http(b"POST /x HTTP/1.1\r\n"));
+        assert!(looks_like_http(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(!looks_like_http(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+        assert!(!looks_like_http(b"\x16\x03\x01"));
+        assert!(!looks_like_http(b""));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_ip_fast_path() {
+        let endpoint = Endpoint::parse("127.0.0.1:443", 443).unwrap();
+        let addrs = resolve_endpoint(&endpoint).await.unwrap();
+        assert_eq!(addrs, vec!["127.0.0.1:443".parse().unwrap()]);
+
+        let v6 = Endpoint::parse("[::1]:8443", 443).unwrap();
+        let addrs = resolve_endpoint(&v6).await.unwrap();
+        assert_eq!(addrs, vec!["[::1]:8443".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_hostname_uses_cache() {
+        let endpoint = Endpoint::parse("localhost:443", 443).unwrap();
+        let addrs = resolve_endpoint(&endpoint).await.unwrap();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|addr| addr.ip().is_loopback()));
+
+        let cached = resolve_endpoint(&endpoint).await.unwrap();
+        assert_eq!(addrs, cached);
+    }
+
+    #[tokio::test]
+    async fn test_passthrough_blocks_private_addresses() {
+        let endpoint = Endpoint::parse("127.0.0.1:443", 443).unwrap();
+        let error = connect_endpoint(&endpoint, false).await.unwrap_err();
+        assert!(error.contains("blocked private address"));
+
+        let endpoint = Endpoint::parse("localhost:443", 443).unwrap();
+        let error = connect_endpoint(&endpoint, false).await.unwrap_err();
+        assert!(error.contains("blocked private address"));
+    }
+
+    #[tokio::test]
+    async fn test_e2e_no_sni_fallback_forwards_exact_bytes() {
+        ensure_test_password();
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let request = b"GET /probe HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let expected = request.clone();
+
+        let backend_task = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let mut received = vec![0u8; expected.len()];
+            socket.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            socket.write_all(b"pong").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let config = ProxyConfig {
+            trojan_snis: vec!["secret.example".to_string()],
+            fallback: Some(Endpoint::parse(&backend_addr.to_string(), 443).unwrap()),
+            local_fallback: Endpoint::parse(BACKEND_ADDR, 80).unwrap(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = test_tls_acceptor();
+        let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let task_config = config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client_with_config(stream, acceptor, sem, &task_config)
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = [0u8; 4];
+        timeout(Duration::from_secs(5), client.read_exact(&mut response))
+            .await
+            .expect("passthrough response timeout")
+            .unwrap();
+        assert_eq!(&response, b"pong");
+
+        let result = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server timeout")
+            .unwrap();
+        assert!(result.is_ok(), "server returned {:?}", result);
+        backend_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_e2e_trojan_sni_terminates_tls() {
+        ensure_test_password();
+        let pair = test_tls_pair();
+        let config = ProxyConfig {
+            trojan_snis: vec!["localhost".to_string()],
+            fallback: None,
+            local_fallback: Endpoint::parse("127.0.0.1:1", 80).unwrap(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let task_config = config.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client_with_config(stream, pair.acceptor, sem, &task_config)
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let tls = timeout(
+            Duration::from_secs(5),
+            pair.connector.connect(server_name, tcp),
+        )
+        .await
+        .expect("TLS handshake timeout")
+        .expect("matching SNI must terminate TLS");
+        drop(tls);
+
+        let result = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server timeout")
+            .unwrap();
+        assert!(result.is_ok(), "server returned {:?}", result);
     }
 }
 
